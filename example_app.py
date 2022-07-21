@@ -1,276 +1,401 @@
 import streamlit as st
-import altair as alt
-import pandas as pd
+
 import numpy as np
-import os, urllib, cv2
+import tempfile
 
-# Streamlit encourages well-structured code, like starting execution in a main() function.
-def main():
-    # Render the readme as markdown using st.markdown.
-    readme_text = st.markdown(get_file_content_as_string("instructions.md"))
+import colorsys
+from copy import deepcopy
+import time
 
-    # Download external dependencies.
-    for filename in EXTERNAL_DEPENDENCIES.keys():
-        download_file(filename)
+from PIL import Image
+from PIL import ImageDraw, ImageFont
+import cv2
 
-    # Once we have the dependencies, add a selector for the app mode on the sidebar.
-    st.sidebar.title("What to do")
-    app_mode = st.sidebar.selectbox("Choose the app mode",
-        ["Show instructions", "Run the app", "Show the source code"])
-    if app_mode == "Show instructions":
-        st.sidebar.success('To continue select "Run the app".')
-    elif app_mode == "Show the source code":
-        readme_text.empty()
-        st.code(get_file_content_as_string("streamlit_app.py"))
-    elif app_mode == "Run the app":
-        readme_text.empty()
-        run_the_app()
+import tensorflow as tf
+from tensorflow.python.ops.gen_resource_variable_ops import var_is_initialized_op_eager_fallback
 
-# This file downloader demonstrates Streamlit animation.
-def download_file(file_path):
-    # Don't download the file twice. (If possible, verify the download using the file length.)
-    if os.path.exists(file_path):
-        if "size" not in EXTERNAL_DEPENDENCIES[file_path]:
-            return
-        elif os.path.getsize(file_path) == EXTERNAL_DEPENDENCIES[file_path]["size"]:
-            return
+st.set_page_config(page_title="Object Detection", page_icon="🚥", layout='centered', initial_sidebar_state="expanded") # Config
 
-    # These are handles to two visual elements to animate.
-    weights_warning, progress_bar = None, None
-    try:
-        weights_warning = st.warning("Downloading %s..." % file_path)
-        progress_bar = st.progress(0)
-        with open(file_path, "wb") as output_file:
-            with urllib.request.urlopen(EXTERNAL_DEPENDENCIES[file_path]["url"]) as response:
-                length = int(response.info()["Content-Length"])
-                counter = 0.0
-                MEGABYTES = 2.0 ** 20.0
-                while True:
-                    data = response.read(8192)
-                    if not data:
-                        break
-                    counter += len(data)
-                    output_file.write(data)
+# @st.cache(allow_output_mutation=True, max_entries=10, ttl=3600)
+@st.cache(allow_output_mutation=True, show_spinner=True, hash_funcs={"MyUnhashableClass": lambda _: None})
+def load_model():
+    print('**MODEL LOADED**') 
+    return tf.keras.models.load_model('models/yolo.h5')
 
-                    # We perform animation by overwriting the elements.
-                    weights_warning.warning("Downloading %s... (%6.2f/%6.2f MB)" %
-                        (file_path, counter / MEGABYTES, length / MEGABYTES))
-                    progress_bar.progress(min(counter / length, 1.0))
+def preprocess_input(image_pil, net_h, net_w):
+    image = np.asarray(image_pil)
+    new_h, new_w, _ = image.shape
 
-    # Finally, we remove these visual elements by calling .empty().
-    finally:
-        if weights_warning is not None:
-            weights_warning.empty()
-        if progress_bar is not None:
-            progress_bar.empty()
+    if (float(net_w)/new_w) < (float(net_h)/new_h):
+        new_h = (new_h * net_w)/new_w
+        new_w = net_w
+    else:
+        new_w = (new_w * net_h)/new_h
+        new_h = net_h
 
-# This is the main app app itself, which appears when the user selects "Run the app".
-def run_the_app():
-    # To make Streamlit fast, st.cache allows us to reuse computation across runs.
-    # In this common pattern, we download data from an endpoint only once.
-    @st.experimental_memo
-    def load_metadata(url):
-        return pd.read_csv(url)
+    # resize the image to the new size
+    #resized = cv2.resize(image[:,:,::-1]/255., (int(new_w), int(new_h)))
+    resized = cv2.resize(image/255., (int(new_w), int(new_h)))
 
-    # This function uses some Pandas magic to summarize the metadata Dataframe.
-    @st.experimental_memo
-    def create_summary(metadata):
-        one_hot_encoded = pd.get_dummies(metadata[["frame", "label"]], columns=["label"])
-        summary = one_hot_encoded.groupby(["frame"]).sum().rename(columns={
-            "label_biker": "biker",
-            "label_car": "car",
-            "label_pedestrian": "pedestrian",
-            "label_trafficLight": "traffic light",
-            "label_truck": "truck"
-        })
-        return summary
+    # embed the image into the standard letter box
+    new_image = np.ones((net_h, net_w, 3)) * 0.5
+    new_image[int((net_h-new_h)//2):int((net_h+new_h)//2), int((net_w-new_w)//2):int((net_w+new_w)//2), :] = resized
+    new_image = np.expand_dims(new_image, 0)
 
-    # An amazing property of st.cached functions is that you can pipe them into
-    # one another to form a computation DAG (directed acyclic graph). Streamlit
-    # recomputes only whatever subset is required to get the right answer!
-    metadata = load_metadata(os.path.join(DATA_URL_ROOT, "labels.csv.gz"))
-    summary = create_summary(metadata)
+    return new_image
 
-    # Uncomment these lines to peek at these DataFrames.
-    # st.write('## Metadata', metadata[:1000], '## Summary', summary[:1000])
+anchors = [[[116,90], [156,198], [373,326]], [[30,61], [62,45], [59,119]], [[10,13], [16,30], [33,23]]] # Initial bounding box sizes
 
-    # Draw the UI elements to search for objects (pedestrians, cars, etc.)
-    selected_frame_index, selected_frame = frame_selector_ui(summary)
-    if selected_frame_index == None:
-        st.error("No frames fit the criteria. Please select different label or number.")
+labels = ["human", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", \
+              "boat", "traffic-light", "fire hydrant", "stop sign", "parking meter", "bench", \
+              "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", \
+              "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", \
+              "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", \
+              "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", \
+              "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", \
+              "chair", "sofa", "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse", \
+              "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", \
+              "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]  
+
+class BoundBox: # Bounding bax structure
+    def __init__(self, xmin, ymin, xmax, ymax, objness = None, classes = None):
+        self.xmin = xmin
+        self.ymin = ymin
+        self.xmax = xmax
+        self.ymax = ymax
+        
+        self.objness = objness
+        self.classes = classes
+
+        self.label = -1
+        self.score = -1
+
+    def get_label(self):
+        if self.label == -1:
+            self.label = np.argmax(self.classes)
+        
+        return self.label
+    
+    def get_score(self):
+        if self.score == -1:
+            self.score = self.classes[self.get_label()]
+            
+        return self.score
+
+def _interval_overlap(interval_a, interval_b):
+    x1, x2 = interval_a
+    x3, x4 = interval_b
+
+    if x3 < x1:
+        if x4 < x1:
+            return 0
+        else:
+            return min(x2,x4) - x1
+    else:
+        if x2 < x3:
+             return 0
+        else:
+            return min(x2,x4) - x3          
+
+def _sigmoid(x): # Processing function
+    return 1. / (1. + np.exp(-x))
+
+def bbox_iou(box1, box2):
+    intersect_w = _interval_overlap([box1.xmin, box1.xmax], [box2.xmin, box2.xmax])
+    intersect_h = _interval_overlap([box1.ymin, box1.ymax], [box2.ymin, box2.ymax])
+    
+    intersect = intersect_w * intersect_h
+
+    w1, h1 = box1.xmax-box1.xmin, box1.ymax-box1.ymin
+    w2, h2 = box2.xmax-box2.xmin, box2.ymax-box2.ymin
+    
+    union = w1*h1 + w2*h2 - intersect
+    
+    return float(intersect) / union
+
+def decode_netout(netout_, obj_thresh, anchors_, image_h, image_w, net_h, net_w):
+    netout_all = deepcopy(netout_)
+    boxes_all = []
+    for i in range(len(netout_all)):
+      netout = netout_all[i][0]
+      anchors = anchors_[i]
+
+      grid_h, grid_w = netout.shape[:2]
+      nb_box = 3
+      netout = netout.reshape((grid_h, grid_w, nb_box, -1))
+      nb_class = netout.shape[-1] - 5
+
+      boxes = []
+
+      netout[..., :2]  = _sigmoid(netout[..., :2])
+      netout[..., 4:]  = _sigmoid(netout[..., 4:])
+      netout[..., 5:]  = netout[..., 4][..., np.newaxis] * netout[..., 5:]
+      netout[..., 5:] *= netout[..., 5:] > obj_thresh
+
+      for i in range(grid_h*grid_w):
+          row = i // grid_w
+          col = i % grid_w
+          
+          for b in range(nb_box):
+              # 4th element is objectness score
+              objectness = netout[row][col][b][4]
+              #objectness = netout[..., :4]
+              # last elements are class probabilities
+              classes = netout[row][col][b][5:]
+              
+              if((classes <= obj_thresh).all()): continue
+              
+              # first 4 elements are x, y, w, and h
+              x, y, w, h = netout[row][col][b][:4]
+
+              x = (col + x) / grid_w # center position, unit: image width
+              y = (row + y) / grid_h # center position, unit: image height
+              w = anchors[b][0] * np.exp(w) / net_w # unit: image width
+              h = anchors[b][1] * np.exp(h) / net_h # unit: image height  
+            
+              box = BoundBox(x-w/2, y-h/2, x+w/2, y+h/2, objectness, classes)
+
+              boxes.append(box)
+
+      boxes_all += boxes
+
+    # Correct boxes
+    boxes_all = correct_yolo_boxes(boxes_all, image_h, image_w, net_h, net_w)
+    
+    return boxes_all
+
+def correct_yolo_boxes(boxes_, image_h, image_w, net_h, net_w):
+    boxes = deepcopy(boxes_)
+    if (float(net_w)/image_w) < (float(net_h)/image_h):
+        new_w = net_w
+        new_h = (image_h*net_w)/image_w
+    else:
+        new_h = net_w
+        new_w = (image_w*net_h)/image_h
+        
+    for i in range(len(boxes)):
+        x_offset, x_scale = (net_w - new_w)/2./net_w, float(new_w)/net_w
+        y_offset, y_scale = (net_h - new_h)/2./net_h, float(new_h)/net_h
+        
+        boxes[i].xmin = int((boxes[i].xmin - x_offset) / x_scale * image_w)
+        boxes[i].xmax = int((boxes[i].xmax - x_offset) / x_scale * image_w)
+        boxes[i].ymin = int((boxes[i].ymin - y_offset) / y_scale * image_h)
+        boxes[i].ymax = int((boxes[i].ymax - y_offset) / y_scale * image_h)
+    return boxes
+        
+def do_nms(boxes_, nms_thresh, obj_thresh):
+    boxes = deepcopy(boxes_)
+    if len(boxes) > 0:
+        num_class = len(boxes[0].classes)
+    else:
         return
+        
+    for c in range(num_class):
+        sorted_indices = np.argsort([-box.classes[c] for box in boxes])
 
-    # Draw the UI element to select parameters for the YOLO object detector.
-    confidence_threshold, overlap_threshold = object_detector_ui()
+        for i in range(len(sorted_indices)):
+            index_i = sorted_indices[i]
 
-    # Load the image from S3.
-    image_url = os.path.join(DATA_URL_ROOT, selected_frame)
-    image = load_image(image_url)
+            if boxes[index_i].classes[c] == 0: continue
 
-    # Add boxes for objects on the image. These are the boxes for the ground image.
-    boxes = metadata[metadata.frame == selected_frame].drop(columns=["frame"])
-    draw_image_with_boxes(image, boxes, "Ground Truth",
-        "**Human-annotated data** (frame `%i`)" % selected_frame_index)
+            for j in range(i+1, len(sorted_indices)):
+                index_j = sorted_indices[j]
 
-    # Get the boxes for the objects detected by YOLO by running the YOLO model.
-    yolo_boxes = yolo_v3(image, confidence_threshold, overlap_threshold)
-    draw_image_with_boxes(image, yolo_boxes, "Real-time Computer Vision",
-        "**YOLO v3 Model** (overlap `%3.1f`) (confidence `%3.1f`)" % (overlap_threshold, confidence_threshold))
+                if bbox_iou(boxes[index_i], boxes[index_j]) >= nms_thresh:
+                    boxes[index_j].classes[c] = 0
 
-# This sidebar UI is a little search engine to find certain object types.
-def frame_selector_ui(summary):
-    st.sidebar.markdown("# Frame")
+    new_boxes = []
+    for box in boxes:
+        label = -1
+        
+        for i in range(num_class):
+            if box.classes[i] > obj_thresh:
+                label = i
+                # print("{}: {}, ({}, {})".format(labels[i], box.classes[i]*100, box.xmin, box.ymin))
+                box.label = label
+                box.score = box.classes[i]
+                new_boxes.append(box)    
 
-    # The user can pick which type of object to search for.
-    object_type = st.sidebar.selectbox("Search for which objects?", summary.columns, 2)
+    return new_boxes
 
-    # The user can select a range for how many of the selected objecgt should be present.
-    min_elts, max_elts = st.sidebar.slider("How many %ss (select a range)?" % object_type, 0, 25, [10, 20])
-    selected_frames = get_selected_frames(summary, object_type, min_elts, max_elts)
-    if len(selected_frames) < 1:
-        return None, None
+def draw_boxes(image_, boxes, labels, video=False):
+    image = image_.copy()
+    image_w, image_h = image.size
+    # font = ImageFont.truetype(font='/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf',
+    #                 size=np.floor(3e-2 * image_h + 0.5).astype('int32'))
 
-    # Choose a frame out of the selected frames.
-    selected_frame_index = st.sidebar.slider("Choose a frame (index)", 0, len(selected_frames) - 1, 0)
+    objects_found = []
 
-    # Draw an altair chart in the sidebar with information on the frame.
-    objects_per_frame = summary.loc[selected_frames, object_type].reset_index(drop=True).reset_index()
-    chart = alt.Chart(objects_per_frame, height=120).mark_area().encode(
-        alt.X("index:Q", scale=alt.Scale(nice=False)),
-        alt.Y("%s:Q" % object_type))
-    selected_frame_df = pd.DataFrame({"selected_frame": [selected_frame_index]})
-    vline = alt.Chart(selected_frame_df).mark_rule(color="red").encode(x = "selected_frame")
-    st.sidebar.altair_chart(alt.layer(chart, vline))
+    font = ImageFont.truetype("models/arial.ttf", 20)
 
-    selected_frame = selected_frames[selected_frame_index]
-    return selected_frame_index, selected_frame
+    thickness = (image_w + image_h) // 300
 
-# Select frames based on the selection in the sidebar
-@st.cache(hash_funcs={np.ufunc: str})
-def get_selected_frames(summary, label, min_elts, max_elts):
-    return summary[np.logical_and(summary[label] >= min_elts, summary[label] <= max_elts)].index
+    hsv_tuples = [(x / len(labels), 1., 1.)
+                  for x in range(len(labels))]
+    colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
+    colors = list(
+        map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), colors))
+    np.random.seed(10101)  
+    np.random.shuffle(colors)  
+    np.random.seed(None)  
 
-# This sidebar UI lets the user select parameters for the YOLO object detector.
-def object_detector_ui():
-    st.sidebar.markdown("# Model")
-    confidence_threshold = st.sidebar.slider("Confidence threshold", 0.0, 1.0, 0.5, 0.01)
-    overlap_threshold = st.sidebar.slider("Overlap threshold", 0.0, 1.0, 0.3, 0.01)
-    return confidence_threshold, overlap_threshold
+    if boxes == None:
+        return image, []
+    for i, box in reversed(list(enumerate(boxes))):
+        c = box.get_label()
+        predicted_class = labels[c]
+        score = box.get_score()
+        top, left, bottom, right = box.ymin, box.xmin, box.ymax, box.xmax
 
-# Draws an image with boxes overlayed to indicate the presence of cars, pedestrians etc.
-def draw_image_with_boxes(image, boxes, header, description):
-    # Superpose the semi-transparent object detection boxes.    # Colors for the boxes
-    LABEL_COLORS = {
-        "car": [255, 0, 0],
-        "pedestrian": [0, 255, 0],
-        "truck": [0, 0, 255],
-        "trafficLight": [255, 255, 0],
-        "biker": [255, 0, 255],
-    }
-    image_with_boxes = image.astype(np.float64)
-    for _, (xmin, ymin, xmax, ymax, label) in boxes.iterrows():
-        image_with_boxes[int(ymin):int(ymax),int(xmin):int(xmax),:] += LABEL_COLORS[label]
-        image_with_boxes[int(ymin):int(ymax),int(xmin):int(xmax),:] /= 2
+        label = '{} {:.2f}'.format(predicted_class, score)
+        draw = ImageDraw.Draw(image)
+        label_size = draw.textsize(label, font)
 
-    # Draw the header and image.
-    st.subheader(header)
-    st.markdown(description)
-    st.image(image_with_boxes.astype(np.uint8), use_column_width=True)
+        top = max(0, np.floor(top + 0.5).astype('int32'))
+        left = max(0, np.floor(left + 0.5).astype('int32'))
+        bottom = min(image_h, np.floor(bottom + 0.5).astype('int32'))
+        right = min(image_w, np.floor(right + 0.5).astype('int32'))
+        
+        objects_found.append(label)
 
-# Download a single file and make its content available as a string.
-@st.experimental_singleton(show_spinner=False)
-def get_file_content_as_string(path):
-    url = 'https://raw.githubusercontent.com/streamlit/demo-self-driving/master/' + path
-    response = urllib.request.urlopen(url)
-    return response.read().decode("utf-8")
+        if top - label_size[1] >= 0:
+            text_origin = np.array([left, top - label_size[1]])
+        else:
+            text_origin = np.array([left, top + 1])
 
-# This function loads an image from Streamlit public repo on S3. We use st.cache on this
-# function as well, so we can reuse the images across runs.
-@st.experimental_memo(show_spinner=False)
-def load_image(url):
-    with urllib.request.urlopen(url) as response:
-        image = np.asarray(bytearray(response.read()), dtype="uint8")
-    image = cv2.imdecode(image, cv2.IMREAD_COLOR)
-    image = image[:, :, [2, 1, 0]] # BGR -> RGB
-    return image
+        for i in range(thickness):
+            draw.rectangle(
+                [left + i, top + i, right - i, bottom - i],
+                outline=colors[c])
+        draw.rectangle(
+            [tuple(text_origin), tuple(text_origin + label_size)],
+            fill=colors[c])
+        draw.text(text_origin, label, fill=(0, 0, 0), font=font)
+        del draw
+    for i in range(len(objects_found)):
+        split_string = objects_found[i].split(' ', 1)
+        objects_found[i] = split_string[0]
+    return image, objects_found
 
-# Run the YOLO model to detect objects.
-def yolo_v3(image, confidence_threshold, overlap_threshold):
-    # Load the network. Because this is cached it will only happen once.
-    @st.cache(allow_output_mutation=True)
-    def load_network(config_path, weights_path):
-        net = cv2.dnn.readNetFromDarknet(config_path, weights_path)
-        output_layer_names = net.getLayerNames()
-        output_layer_names = [output_layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-        return net, output_layer_names
-    net, output_layer_names = load_network("yolov3.cfg", "yolov3.weights")
+darknet = load_model() 
 
-    # Run the YOLO neural net.
-    blob = cv2.dnn.blobFromImage(image, 1 / 255.0, (416, 416), swapRB=True, crop=False)
-    net.setInput(blob)
-    layer_outputs = net.forward(output_layer_names)
+def predict_frame(image_pil, obj_thresh = 0.4, nms_thresh = 0.45, darknet=darknet, net_h=416, net_w=416, anchors=anchors, labels=labels, video=False):
+    new_image = preprocess_input(image_pil, net_h, net_w)
+    yolo_outputs = darknet.predict(new_image)
 
-    # Supress detections in case of too low confidence or too much overlap.
-    boxes, confidences, class_IDs = [], [], []
-    H, W = image.shape[:2]
-    for output in layer_outputs:
-        for detection in output:
-            scores = detection[5:]
-            classID = np.argmax(scores)
-            confidence = scores[classID]
-            if confidence > confidence_threshold:
-                box = detection[0:4] * np.array([W, H, W, H])
-                centerX, centerY, width, height = box.astype("int")
-                x, y = int(centerX - (width / 2)), int(centerY - (height / 2))
-                boxes.append([x, y, int(width), int(height)])
-                confidences.append(float(confidence))
-                class_IDs.append(classID)
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, confidence_threshold, overlap_threshold)
+    boxes = decode_netout(yolo_outputs, obj_thresh, anchors, 400, 720, net_h, net_w)
 
-    # Map from YOLO labels to Udacity labels.
-    UDACITY_LABELS = {
-        0: 'pedestrian',
-        1: 'biker',
-        2: 'car',
-        3: 'biker',
-        5: 'truck',
-        7: 'truck',
-        9: 'trafficLight'
-    }
-    xmin, xmax, ymin, ymax, labels = [], [], [], [], []
-    if len(indices) > 0:
-        # loop over the indexes we are keeping
-        for i in indices.flatten():
-            label = UDACITY_LABELS.get(class_IDs[i], None)
-            if label is None:
-                continue
+    boxes = do_nms(boxes, nms_thresh, obj_thresh) 
+    img_detect, objects = draw_boxes(image_pil, boxes, labels)
+    if video:
+        return img_detect
+    return img_detect, objects
 
-            # extract the bounding box coordinates
-            x, y, w, h = boxes[i][0], boxes[i][1], boxes[i][2], boxes[i][3]
+def predict_uploaded_image(image_path):
+  raw_image = Image.open(image_path).convert('RGB')
+  image_pil = raw_image.resize((720,400))
+  
+  return predict_frame(image_pil)
 
-            xmin.append(x)
-            ymin.append(y)
-            xmax.append(x+w)
-            ymax.append(y+h)
-            labels.append(label)
+def read_video(vidcap, counter):
+    success,image = vidcap.read()
+    count = 0
+    
+    imgs = []
+    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT)) 
 
-    boxes = pd.DataFrame({"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax, "labels": labels})
-    return boxes[["xmin", "ymin", "xmax", "ymax", "labels"]]
+    for i in range(1, frame_count + 1):
+        success,image = vidcap.read()
+        imgs.append(image)
+        count += 1
 
-# Path to the Streamlit public S3 bucket
-DATA_URL_ROOT = "https://streamlit-self-driving.s3-us-west-2.amazonaws.com/"
+    frames = []
+    
+    for frame in range(1, frame_count-1, counter):
+        pil_converted = Image.fromarray(cv2.cvtColor(imgs[frame], cv2.COLOR_BGR2RGB))
+        image_pil = pil_converted.resize((720,400))
+        frames.append(image_pil)
+    return frames
 
-# External files to download.
-EXTERNAL_DEPENDENCIES = {
-    "yolov3.weights": {
-        "url": "https://pjreddie.com/media/files/yolov3.weights",
-        "size": 248007048
-    },
-    "yolov3.cfg": {
-        "url": "https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg",
-        "size": 8342
-    }
-}
+def main():
+    st.title('Object Detection')
+    st.caption('An interactive project built by Veer Sandhu with [Inspirit AI] (https://www.inspiritai.com/)')
+    navigation = st.selectbox('Navigation', ('Home','App Demo'))
+    if navigation == 'Home':    
+        st.sidebar.write('Navigate to the **"App Demo"** section to view the project in action!')
 
-if __name__ == "__main__":
+        st.write('## Summary')
+        st.write('This project employs the usage of a YoloV3 neural network that is capable of locating and classifying objects in visual data. The YoloV3 model \
+            has been deployed on this web app and integrated into the user interface through data inputs and outputs. The model contains a total of `252` layers and `62,001,757` parameters. \
+            ')
+        st.image('https://miro.medium.com/max/2000/1*d4Eg17IVJ0L41e7CTWLLSg.png')
+        st.write('## Functionality')
+        st.write('Given an image or a video, the model will localize objects (seen through the bounding boxes) and further classify each object \
+            into a specific category. Each classification also includes a numeric probability representing the "likelyhood" of an object being a specific class.')
+        st.image('https://cdn.analyticsvidhya.com/wp-content/uploads/2018/12/Screenshot-from-2018-11-29-13-03-17.png')
+        st.write('## Resources')
+        st.markdown('- [Github Repository](https://github.com/Real-VeerSandhu/Object-Detection)')
+    else:
+        file = st.sidebar.file_uploader("Upload An Image or Video", help='Select an image or video on your local device for the object detection model to process and output', type=['jpg', 'png', 'mp4'])
+        st.sidebar.markdown('----')
+        st.write('Upload an image or video through the **sidebar menu** for the `YoloV3` model to process and output')
+        if file:
+            st.write('**Input File:**')
+            if '.mp4' not in file.name: # Predict with images
+                st.write(file.name, file)
+                if st.sidebar.button('Run'):
+                    st.markdown('----')
+                    st.write('**Prediction:**')
+                    prediction = predict_uploaded_image(file)
+
+                    predicted_image = prediction[0]
+                    objects_detected = prediction[1]
+                
+                    st.image(predicted_image)
+                    
+                    time.sleep(0.1)
+                    if objects_detected != []: # Check if any objects WERE detected 
+                        st.write('*Found...*')
+                        for object in set(objects_detected):
+                            if objects_detected.count(object) == 1:
+                                st.write(f'`{objects_detected.count(object)} {object}`')
+                            else:
+                                st.write(f'`{objects_detected.count(object)} {object}s`')
+                        with st.expander('View Raw'):
+                            st.image(Image.open(file).resize((680,400)), caption=('Original Image'))
+                    else:
+                        st.write('*No objects detected*') # Pass error
+            else: # Predict with videos
+                stutter_speed = st.sidebar.slider('Video Frame Time', 1, 10)
+        
+                read_file = file.read()
+                tfile = tempfile.NamedTemporaryFile(delete=False)
+                tfile.write(read_file)
+
+                vidcap = cv2.VideoCapture(tfile.name)
+                frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+                fps = int(vidcap.get(cv2.CAP_PROP_FPS))
+
+                st.write(file.name, file)
+                st.write(f'`Total Frames:` {frame_count}', f'`Duration:` {int(frame_count/fps)} seconds')
+
+                key = st.sidebar.text_input('Safety Key', help='Only those given access can upload videos (try an image)')
+                # key = '2bar1bounce!Lefthudline'
+                # key_status = True
+
+                if st.sidebar.button('Run'):
+                    if key == '2bar1bounce!Lefthudline': # Prevent app overload, only users with the key can perform expensive computations
+                        st.sidebar.caption('Video Passed...')
+                        video_frames = read_video(vidcap, stutter_speed)
+                        st.markdown('----')
+                        st.write('**Prediction:**')
+                        with st.empty():
+                            for i in range(len(video_frames)):
+                                st.image(predict_frame(video_frames[i], video=True))
+                                time.sleep(0.001)
+                    else:
+                        st.sidebar.caption('Incorrect Safety Key...') # Detect incorrect safety key
+
+if __name__ == '__main__':
     main()
+    print('Running...')
