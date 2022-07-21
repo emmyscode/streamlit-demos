@@ -2,3 +2,6 @@ streamlit==1.11.0
 numpy==1.23.1
 matplotlib==3.5.2
 pandas==1.4.3
+tensorflow==2.3.0
+opency-python-headless==4.5.1.48
+Pillow==8.4.0
