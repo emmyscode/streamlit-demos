@@ -3,5 +3,5 @@ numpy==1.23.1
 matplotlib==3.5.2
 pandas==1.4.3
 tensorflow==2.9.1
-opency-python-headless==4.5.1.48
-Pillow==8.4.0
+opencv-python-headless==4.6.0.66
+Pillow==9.2.0
