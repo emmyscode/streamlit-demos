@@ -8,4 +8,4 @@ streamlit run https://raw.githubusercontent.com/emmyscode/streamlit/main/example
 ```
 ### Questions? Comments?
 
-Connect with me [on Github](https://github.com/emmyscode)
+Connect with me [on Github](https://github.com/emmyscode) or LinkedIn
