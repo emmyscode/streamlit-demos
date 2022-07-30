@@ -1,4 +1,4 @@
-# Streamlit Demo: Sketch Recognition
+# Streamlit Demos
 Welcome to the Github repo for the example demo of Sketch Recognition written in pure Python to interactively categorize handdrawn doodles with a neural network.
 
 ## Run this demo locally
